@@ -24,14 +24,14 @@ class Config:
 
     # Distributed training parameters
     NUM_GPUS = 8
-    NUM_WORKERS = 4  # Per GPU
-    BATCH_SIZE = 32  # Per GPU, effective batch size = BATCH_SIZE * NUM_GPUS
+    NUM_WORKERS = 2  # Reduced for initial testing
+    BATCH_SIZE = 16  # Reduced for initial testing
 
-    # Training parameters
-    NUM_EPOCHS = 3
+    # Training parameters - simplified for initial testing
+    NUM_EPOCHS = 1
     BASE_LR = 2.5e-4
     WEIGHT_DECAY = 0.05
-    WARMUP_EPOCHS = 5
+    WARMUP_EPOCHS = 1
     MIN_LR = 1e-5
     DROP_PATH = 0.2
 
@@ -50,7 +50,7 @@ class Config:
     OUTPUT_DIR = os.path.join("outputs", datetime.now().strftime("%Y%m%d_%H%M%S"))
     LOG_INTERVAL = 50
     EVAL_INTERVAL = 1
-    CKPT_INTERVAL = 5
+    CKPT_INTERVAL = 1
 
     # Random seed for reproducibility
     SEED = 42
