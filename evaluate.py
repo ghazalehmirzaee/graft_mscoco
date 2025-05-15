@@ -66,8 +66,20 @@ def evaluate(config, checkpoint_path, visualize=False):
 
     # Load checkpoint
     print(f"Loading checkpoint from {checkpoint_path}")
-    # Fixed: Set weights_only=False to allow loading of argparse.Namespace objects
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    # FIXED: Load checkpoint with weights_only=False
+    try:
+        import argparse
+        from torch.serialization import add_safe_globals
+
+        # Add argparse.Namespace to the safelist
+        with add_safe_globals([argparse.Namespace]):
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    except Exception as e:
+        print(f"First loading attempt failed with error: {str(e)}")
+        print("Trying with weights_only=False for backward compatibility...")
+        # Fall back to the less secure option if needed
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
     # Load model weights
     model.load_state_dict(checkpoint['model'])
