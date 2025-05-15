@@ -166,29 +166,33 @@ class SpatialGraph(nn.Module):
         Compute spatial distribution grids for each class.
 
         Args:
-            bboxes: List of bounding boxes [batch_size, num_boxes, 4] in format [x, y, width, height]
-            bbox_classes: Class indices for each box [batch_size, num_boxes]
+            bboxes: List of bounding boxes tensors [num_boxes, 4] in format [x, y, width, height] for each image
+            bbox_classes: List of class indices tensors [num_boxes] for each image
             img_size: Size of the input image
 
         Returns:
             Dict of spatial distribution grids for each scale
         """
-        batch_size = bboxes[0].shape[0] if len(bboxes) > 0 else 0
+        batch_size = len(bboxes)
         distributions = {}
 
         for scale in self.scales:
             # Initialize distribution grid for each class
             grid = torch.zeros(batch_size, self.num_classes, scale, scale,
-                               device=bboxes[0].device if len(bboxes) > 0 else 'cpu')
+                               device=bboxes[0].device if len(bboxes) > 0 and len(bboxes[0]) > 0 else 'cpu')
 
             # For each batch
             for b in range(batch_size):
-                if b < len(bboxes) and len(bboxes[b]) > 0:
+                if len(bboxes[b]) > 0:
                     batch_boxes = bboxes[b]  # [num_boxes, 4]
                     batch_classes = bbox_classes[b]  # [num_boxes]
 
                     # For each box
-                    for box, cls in zip(batch_boxes, batch_classes):
+                    for box_idx in range(len(batch_boxes)):
+                        box = batch_boxes[box_idx]
+                        cls = batch_classes[box_idx].item() if isinstance(batch_classes[box_idx], torch.Tensor) else \
+                        batch_classes[box_idx]
+
                         if cls >= 0 and cls < self.num_classes:
                             # Normalize box coordinates
                             x, y, w, h = box
@@ -198,10 +202,14 @@ class SpatialGraph(nn.Module):
                             y2 = max(0, min(img_size - 1, y + h))
 
                             # Convert to grid indices
-                            grid_x1 = int(x1 * scale / img_size)
-                            grid_y1 = int(y1 * scale / img_size)
-                            grid_x2 = int(x2 * scale / img_size)
-                            grid_y2 = int(y2 * scale / img_size)
+                            grid_x1 = int(x1.item() * scale / img_size) if isinstance(x1, torch.Tensor) else int(
+                                x1 * scale / img_size)
+                            grid_y1 = int(y1.item() * scale / img_size) if isinstance(y1, torch.Tensor) else int(
+                                y1 * scale / img_size)
+                            grid_x2 = int(x2.item() * scale / img_size) if isinstance(x2, torch.Tensor) else int(
+                                x2 * scale / img_size)
+                            grid_y2 = int(y2.item() * scale / img_size) if isinstance(y2, torch.Tensor) else int(
+                                y2 * scale / img_size)
 
                             # Update grid (simple presence, not density)
                             grid[b, cls, grid_y1:grid_y2 + 1, grid_x1:grid_x2 + 1] = 1
@@ -210,6 +218,7 @@ class SpatialGraph(nn.Module):
             distributions[scale] = grid.view(batch_size, self.num_classes, scale * scale)
 
         return distributions
+
 
     def _compute_spatial_affinity(self, spatial_dists):
         """

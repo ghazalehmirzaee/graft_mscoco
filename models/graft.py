@@ -170,8 +170,9 @@ class GRAFT(nn.Module):
         Args:
             images: Input images (B, C, H, W)
             labels: Ground-truth labels (B, num_classes) for loss computation
-            bboxes: List of bounding boxes for spatial graph
-            bbox_classes: List of class indices for bounding boxes
+            bboxes: List of bounding boxes tensors for each image, where each tensor has shape (num_boxes_i, 4)
+                    and format [x, y, width, height]
+            bbox_classes: List of class indices tensors for each image, where each tensor has shape (num_boxes_i)
 
         Returns:
             Dict containing model outputs and loss if labels are provided
@@ -220,3 +221,4 @@ class GRAFT(nn.Module):
             'loss': loss
         }
 
+    
