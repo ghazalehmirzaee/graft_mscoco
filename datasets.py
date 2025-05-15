@@ -156,6 +156,32 @@ def get_val_transform():
     ])
 
 
+def custom_collate_fn(batch):
+    """
+    Custom collate function that handles variable-sized bounding box data.
+
+    Args:
+        batch: List of samples from the dataset
+
+    Returns:
+        Properly collated batch
+    """
+    images = torch.stack([sample['image'] for sample in batch])
+    labels = torch.stack([sample['labels'] for sample in batch])
+    img_ids = [sample['img_id'] for sample in batch]
+
+    # Handle bounding boxes (don't stack, keep as a list)
+    bboxes = [sample['bboxes'] for sample in batch]
+    bbox_cat_idxs = [sample['bbox_cat_idxs'] for sample in batch]
+
+    return {
+        'image': images,
+        'labels': labels,
+        'bboxes': bboxes,
+        'bbox_cat_idxs': bbox_cat_idxs,
+        'img_id': img_ids
+    }
+
 def create_dataloaders(config, world_size=None, rank=None):
     """Creates dataloaders for training and validation."""
     # Create datasets
@@ -191,7 +217,7 @@ def create_dataloaders(config, world_size=None, rank=None):
         train_sampler = None
         val_sampler = None
 
-    # Create dataloaders
+    # Create dataloaders with custom collate function
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.BATCH_SIZE,
@@ -199,7 +225,8 @@ def create_dataloaders(config, world_size=None, rank=None):
         sampler=train_sampler,
         num_workers=config.NUM_WORKERS,
         pin_memory=True,
-        drop_last=True
+        drop_last=True,
+        collate_fn=custom_collate_fn  # Use custom collate function
     )
 
     val_loader = DataLoader(
@@ -209,7 +236,8 @@ def create_dataloaders(config, world_size=None, rank=None):
         sampler=val_sampler,
         num_workers=config.NUM_WORKERS,
         pin_memory=True,
-        drop_last=False
+        drop_last=False,
+        collate_fn=custom_collate_fn  # Use custom collate function
     )
 
     return train_loader, val_loader, train_dataset, val_dataset
