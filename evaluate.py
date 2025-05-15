@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 from config import Config
-from datasets import CocoMultiLabelDataset, get_val_transform
+from datasets import CocoMultiLabelDataset, get_val_transform, custom_collate_fn
 from models.graft import GRAFT
 from utils import compute_metrics, visualize_predictions, visualize_attention, set_seed
 
@@ -50,13 +50,14 @@ def evaluate(config, checkpoint_path, visualize=False):
     class_names = val_dataset.coco.loadCats(val_dataset.cat_ids)
     class_names = [cat['name'] for cat in class_names]
 
-    # Create dataloader
+    # Create dataloader with custom collate function
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.BATCH_SIZE,
         shuffle=False,
         num_workers=config.NUM_WORKERS,
-        pin_memory=True
+        pin_memory=True,
+        collate_fn=custom_collate_fn  # Use custom collate function
     )
 
     # Create model
@@ -85,13 +86,12 @@ def evaluate(config, checkpoint_path, visualize=False):
             # Get inputs and labels
             images = sample['image'].to(device, non_blocking=True)
             labels = sample['labels'].to(device, non_blocking=True)
-            bboxes = sample['bboxes']
-            bbox_cat_idxs = sample['bbox_cat_idxs']
+            bboxes = sample['bboxes']  # Already a list of tensors
+            bbox_cat_idxs = sample['bbox_cat_idxs']  # Already a list of tensors
 
             # Move bbox data to device
-            if all(b is not None for b in bboxes):
-                bboxes = [b.to(device, non_blocking=True) for b in bboxes]
-                bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
+            bboxes = [b.to(device, non_blocking=True) for b in bboxes]
+            bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
 
             # Forward pass
             outputs = model(images, labels, bboxes, bbox_cat_idxs)
@@ -152,6 +152,7 @@ def evaluate(config, checkpoint_path, visualize=False):
                 all_targets[idx:idx + 1],
                 all_logits[idx:idx + 1],
                 class_names,
+                # Use generic class names if actual ones not available
                 num_samples=1
             )
             fig.savefig(os.path.join(config.OUTPUT_DIR, 'visualizations', f'prediction_{i}.png'))
