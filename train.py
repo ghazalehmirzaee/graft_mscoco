@@ -173,13 +173,12 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, config, writer
         # Get inputs and labels
         images = sample['image'].to(device, non_blocking=True)
         labels = sample['labels'].to(device, non_blocking=True)
-        bboxes = sample['bboxes']
-        bbox_cat_idxs = sample['bbox_cat_idxs']
+        bboxes = sample['bboxes']  # Already a list of tensors
+        bbox_cat_idxs = sample['bbox_cat_idxs']  # Already a list of tensors
 
         # Move bbox data to device
-        if all(b is not None for b in bboxes):
-            bboxes = [b.to(device, non_blocking=True) for b in bboxes]
-            bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
+        bboxes = [b.to(device, non_blocking=True) for b in bboxes]
+        bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
 
         # Zero the parameter gradients
         optimizer.zero_grad()
