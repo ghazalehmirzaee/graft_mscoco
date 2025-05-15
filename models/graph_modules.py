@@ -10,17 +10,19 @@ class CooccurrenceGraph(nn.Module):
     Captures statistical relationships between labels.
     """
 
-    def __init__(self, num_classes, cooccurrence_matrix=None, hidden_dim=256):
+    def __init__(self, num_classes, cooccurrence_matrix=None, hidden_dim=256, simplified=False):
         """
         Args:
             num_classes: Number of label classes
             cooccurrence_matrix: Pre-computed co-occurrence matrix (can be None during initialization)
             hidden_dim: Dimension of hidden node embeddings
+            simplified: Whether to use simplified operations for less memory usage
         """
         super().__init__()
 
         self.num_classes = num_classes
         self.hidden_dim = hidden_dim
+        self.simplified = simplified
 
         # Label embeddings
         self.label_embeddings = nn.Parameter(torch.randn(num_classes, hidden_dim))
@@ -45,12 +47,13 @@ class CooccurrenceGraph(nn.Module):
         """Apply adaptive class balancing to the co-occurrence matrix."""
         # Get class counts from diagonal of co-occurrence
         class_counts = torch.diag(self.cooccurrence)
+        class_counts = torch.clamp(class_counts, min=1e-10)  # Prevent division by zero
 
         # Calculate balancing weights
         max_count = class_counts.max()
         avg_count = class_counts.mean()
 
-        # Apply adaptive balancing formula - simplified from the paper
+        # Apply adaptive balancing formula - simplified version
         alpha = 0.3
         beta = 0.5
 
@@ -60,8 +63,8 @@ class CooccurrenceGraph(nn.Module):
                 if i != j:  # Skip diagonal elements
                     # Calculate balance factor based on frequency of rare class
                     rare_idx = i if class_counts[i] < class_counts[j] else j
-                    rare_weight = ((max_count / avg_count) ** alpha) * (
-                            (min(class_counts[i], class_counts[j]) / max(class_counts[i], class_counts[j])) ** beta)
+                    ratio = min(class_counts[i], class_counts[j]) / max(class_counts[i], class_counts[j])
+                    rare_weight = ((max_count / avg_count) ** alpha) * (ratio ** beta)
 
                     # Apply correction weight
                     self.cooccurrence[i, j] *= rare_weight
@@ -86,12 +89,36 @@ class CooccurrenceGraph(nn.Module):
             Updated node features
         """
         batch_size = x.shape[0]
-        device = x.device  # FIXED: Get device from input tensor
+        device = x.device  # Get device from input tensor
 
         # Use label embeddings as node features if x is None
         if x is None:
             x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
 
+        # Simplified processing to reduce memory usage
+        if self.simplified:
+            # Generate queries from input
+            q = self.proj_q(x)  # (batch_size, num_classes, hidden_dim)
+
+            # Direct application of co-occurrence weights
+            cooccurrence = self.cooccurrence.to(device)
+            # Process batches with less memory by splitting
+            outputs = []
+
+            chunk_size = max(1, batch_size // 2)  # Process half batch at a time
+            for i in range(0, batch_size, chunk_size):
+                end_idx = min(i + chunk_size, batch_size)
+                chunk_x = x[i:end_idx]
+                chunk_q = q[i:end_idx]
+
+                # Apply co-occurrence directly
+                chunk_out = torch.bmm(cooccurrence.unsqueeze(0).expand(end_idx - i, -1, -1), chunk_x)
+                chunk_out = self.proj_out(chunk_out)
+                outputs.append(chunk_out)
+
+            return torch.cat(outputs, dim=0)
+
+        # Full processing if not simplified
         # Generate queries, keys, values
         q = self.proj_q(x)  # (batch_size, num_classes, hidden_dim)
         k = self.proj_k(x)  # (batch_size, num_classes, hidden_dim)
@@ -102,7 +129,6 @@ class CooccurrenceGraph(nn.Module):
                     self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
 
         # Apply co-occurrence as edge weights
-        # FIXED: Ensure cooccurrence is on the same device
         cooccurrence = self.cooccurrence.to(device)
         scores = scores * cooccurrence.unsqueeze(0)
 
@@ -122,24 +148,28 @@ class CooccurrenceGraph(nn.Module):
         return out
 
 
+# Update only the SpatialGraph class in the graph_modules.py file
+
 class SpatialGraph(nn.Module):
     """
     Spatial Relationship Graph Module.
     Captures spatial relationships between objects.
     """
 
-    def __init__(self, num_classes, scales=(10, 20), hidden_dim=256):
+    def __init__(self, num_classes, scales=(10, 20), hidden_dim=256, simplified=False):
         """
         Args:
             num_classes: Number of label classes
             scales: Tuple of grid scales (default: (10, 20))
             hidden_dim: Dimension of hidden node embeddings
+            simplified: Whether to use simplified operations for less memory usage
         """
         super().__init__()
 
         self.num_classes = num_classes
         self.scales = scales
         self.hidden_dim = hidden_dim
+        self.simplified = simplified
 
         # Label embeddings
         self.label_embeddings = nn.Parameter(torch.randn(num_classes, hidden_dim))
@@ -194,7 +224,7 @@ class SpatialGraph(nn.Module):
                     for box_idx in range(len(batch_boxes)):
                         box = batch_boxes[box_idx]
                         cls = batch_classes[box_idx].item() if isinstance(batch_classes[box_idx], torch.Tensor) else \
-                        batch_classes[box_idx]
+                            batch_classes[box_idx]
 
                         if cls >= 0 and cls < self.num_classes:
                             # Normalize box coordinates
@@ -279,6 +309,51 @@ class SpatialGraph(nn.Module):
         if x is None:
             x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1).to(device)
 
+        # Simplified processing for memory efficiency if enabled
+        if self.simplified:
+            # Basic spatial processing without full attention
+            out = x.clone()  # Start with identity mapping
+
+            # If bounding boxes are provided, add simple spatial features
+            if bboxes is not None and bbox_classes is not None and all(len(b) > 0 for b in bboxes):
+                try:
+                    # Simple spatial features based on grid positions
+                    for scale in self.scales:
+                        grid_features = torch.zeros(batch_size, self.num_classes, scale * scale, device=device)
+
+                        # Process in chunks for memory efficiency
+                        chunk_size = max(1, batch_size // 2)
+                        for i in range(0, batch_size, chunk_size):
+                            end_idx = min(i + chunk_size, batch_size)
+                            # Just use simple grid positions
+                            for b in range(i, end_idx):
+                                if len(bboxes[b]) > 0:
+                                    for box_idx, box in enumerate(bboxes[b]):
+                                        if box_idx < len(bbox_classes[b]):
+                                            cls = bbox_classes[b][box_idx].item()
+                                            if 0 <= cls < self.num_classes:
+                                                x, y, w, h = box
+                                                center_x = int((x + w / 2) * scale / 224)
+                                                center_y = int((y + h / 2) * scale / 224)
+                                                pos = center_y * scale + center_x
+                                                if 0 <= pos < scale * scale:
+                                                    grid_features[b, cls, pos] = 1.0
+
+                        # Project to feature space for each scale
+                        scale_idx = self.scales.index(scale)
+                        scale_features = grid_features.view(batch_size * self.num_classes, -1)
+                        scale_embed = self.spatial_embeddings[scale_idx](scale_features)
+                        scale_embed = scale_embed.view(batch_size, self.num_classes, -1)
+
+                        # Add to output with scale weight
+                        out = out + scale_embed * (0.2 + 0.1 * scale_idx)
+
+                except Exception as e:
+                    print(f"Error in simplified spatial processing: {e}")
+
+            return self.proj_out(out)
+
+        # Full processing if not simplified
         # Generate queries, keys, values
         q = self.proj_q(x)  # (batch_size, num_classes, hidden_dim)
         k = self.proj_k(x)  # (batch_size, num_classes, hidden_dim)
@@ -286,7 +361,7 @@ class SpatialGraph(nn.Module):
 
         # Calculate attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) / (
-                    self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
+                self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
 
         # If bounding boxes are provided, compute spatial affinity
         if bboxes is not None and bbox_classes is not None and all(len(b) > 0 for b in bboxes):
@@ -319,13 +394,14 @@ class VisualGraph(nn.Module):
     Captures visual feature similarities between objects.
     """
 
-    def __init__(self, num_classes, feature_dim=768, hidden_dim=256, similarity_threshold=0.5):
+    def __init__(self, num_classes, feature_dim=768, hidden_dim=256, similarity_threshold=0.5, simplified=False):
         """
         Args:
             num_classes: Number of label classes
             feature_dim: Dimension of input visual features
             hidden_dim: Dimension of hidden node embeddings
             similarity_threshold: Threshold for visual similarity
+            simplified: Whether to use simplified operations for less memory usage
         """
         super().__init__()
 
@@ -333,6 +409,7 @@ class VisualGraph(nn.Module):
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.similarity_threshold = similarity_threshold
+        self.simplified = simplified
 
         # Label embeddings
         self.label_embeddings = nn.Parameter(torch.randn(num_classes, hidden_dim))
@@ -380,6 +457,43 @@ class VisualGraph(nn.Module):
         if x is None:
             x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1).to(device)
 
+        # Simplified processing if enabled
+        if self.simplified and visual_features is not None:
+            # Project visual features
+            vis_emb = self.visual_proj(visual_features)  # (batch_size, hidden_dim)
+
+            # More efficient implementation with fewer operations
+            chunk_size = max(1, self.num_classes // 4)  # Process in smaller chunks
+            results = []
+
+            for i in range(0, self.num_classes, chunk_size):
+                end_idx = min(i + chunk_size, self.num_classes)
+                chunk_features = []
+
+                # Extract features for this chunk of classes
+                for class_idx in range(i, end_idx):
+                    # Move extractor to correct device if needed
+                    extractor = self.class_extractors[class_idx].to(device)
+                    class_feat = extractor(vis_emb)
+                    chunk_features.append(class_feat)
+
+                # Stack features for this chunk
+                chunk_result = torch.stack(chunk_features, dim=1)  # (batch_size, chunk_size, hidden_dim)
+                results.append(chunk_result)
+
+            # Combine all chunks
+            class_feats = torch.cat(results, dim=1)  # (batch_size, num_classes, hidden_dim)
+
+            # Simple feature combination without full attention
+            if labels is not None:
+                # Use labels to emphasize important classes
+                label_weights = labels.unsqueeze(-1).float() * 0.5 + 0.5  # (batch_size, num_classes, 1)
+                class_feats = class_feats * label_weights
+
+            # Combine with input features
+            out = x + class_feats
+            return self.proj_out(out)
+
         # Project visual features if provided
         if visual_features is not None:
             vis_emb = self.visual_proj(visual_features)  # (batch_size, hidden_dim)
@@ -403,7 +517,7 @@ class VisualGraph(nn.Module):
 
         # Calculate attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) / (
-                    self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
+                self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
 
         # Apply visual similarity threshold
         similarity_mask = (scores > self.similarity_threshold).float()

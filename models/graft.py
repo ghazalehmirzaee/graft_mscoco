@@ -107,6 +107,8 @@ class GRAFT(nn.Module):
         self.config = config
         self.num_classes = config.NUM_CLASSES
         self.hidden_dim = 256  # Hidden dimension for graph components
+        self.enable_graph = getattr(config, 'ENABLE_GRAPH_COMPONENTS', True)
+        self.simplified_mode = getattr(config, 'SIMPLIFIED_GRAPH_MODE', False)
 
         # Vision Transformer backbone
         self.backbone = ViTBackbone(
@@ -125,34 +127,38 @@ class GRAFT(nn.Module):
             nn.ReLU()
         )
 
-        # Graph components
-        self.cooccurrence_graph = CooccurrenceGraph(
-            num_classes=self.num_classes,
-            cooccurrence_matrix=cooccurrence_matrix,
-            hidden_dim=self.hidden_dim
-        )
+        if self.enable_graph:
+            # Graph components
+            self.cooccurrence_graph = CooccurrenceGraph(
+                num_classes=self.num_classes,
+                cooccurrence_matrix=cooccurrence_matrix,
+                hidden_dim=self.hidden_dim,
+                simplified=self.simplified_mode
+            )
 
-        self.spatial_graph = SpatialGraph(
-            num_classes=self.num_classes,
-            scales=config.SPATIAL_SCALES,
-            hidden_dim=self.hidden_dim
-        )
+            self.spatial_graph = SpatialGraph(
+                num_classes=self.num_classes,
+                scales=config.SPATIAL_SCALES,
+                hidden_dim=self.hidden_dim,
+                simplified=self.simplified_mode
+            )
 
-        self.visual_graph = VisualGraph(
-            num_classes=self.num_classes,
-            feature_dim=self.feature_dim,
-            hidden_dim=self.hidden_dim,
-            similarity_threshold=config.SIMILARITY_THRESHOLD
-        )
+            self.visual_graph = VisualGraph(
+                num_classes=self.num_classes,
+                feature_dim=self.feature_dim,
+                hidden_dim=self.hidden_dim,
+                similarity_threshold=config.SIMILARITY_THRESHOLD,
+                simplified=self.simplified_mode
+            )
 
-        # Graph fusion module
-        self.fusion_module = GraphFusionModule(
-            num_classes=self.num_classes,
-            hidden_dim=self.hidden_dim
-        )
+            # Graph fusion module
+            self.fusion_module = GraphFusionModule(
+                num_classes=self.num_classes,
+                hidden_dim=self.hidden_dim
+            )
 
-        # Final classifier - FIXED: Output 1 value per class instead of num_classes
-        self.classifier = nn.Linear(self.hidden_dim + self.feature_dim, 1)
+        # Final classifier
+        self.classifier = nn.Linear(self.hidden_dim + self.feature_dim if self.enable_graph else self.feature_dim, 1)
 
         # Loss function
         self.criterion = MultiLabelLoss(
@@ -166,7 +172,8 @@ class GRAFT(nn.Module):
 
     def update_cooccurrence(self, cooccurrence_matrix):
         """Update the co-occurrence graph with a new matrix."""
-        self.cooccurrence_graph.update_cooccurrence(cooccurrence_matrix)
+        if self.enable_graph:
+            self.cooccurrence_graph.update_cooccurrence(cooccurrence_matrix)
 
     def forward(self, images, labels=None, bboxes=None, bbox_classes=None):
         """
@@ -190,11 +197,24 @@ class GRAFT(nn.Module):
         logits = backbone_out['logits']
         features = backbone_out['features']
 
-        # Project features to hidden dimension
-        node_features = self.feature_projector(features).unsqueeze(1).expand(-1, self.num_classes, -1)
+        # If graph components are disabled, use backbone logits directly
+        if not self.enable_graph:
+            # Compute loss if labels are provided
+            loss = None
+            if labels is not None:
+                loss = self.criterion(logits, labels)
 
-        # Process graph components with robust error handling
+            return {
+                'logits': logits,
+                'features': features,
+                'loss': loss
+            }
+
+        # Process with graph components
         try:
+            # Project features to hidden dimension
+            node_features = self.feature_projector(features).unsqueeze(1).expand(-1, self.num_classes, -1)
+
             # Ensure all tensors are on the same device
             if bboxes is not None and bbox_classes is not None:
                 # Verify and fix bboxes and bbox_classes device
@@ -216,47 +236,62 @@ class GRAFT(nn.Module):
             # Make sure labels are on correct device if provided
             labels_device = labels.to(device) if labels is not None else None
 
-            # Graph components
-            cooccurrence_feat = self.cooccurrence_graph(node_features, labels_device)
-            spatial_feat = self.spatial_graph(node_features, bboxes_fixed, bbox_classes_fixed)
-            visual_feat = self.visual_graph(node_features, features, labels_device)
-
-            # Fuse graph features
-            fused_graph_feat = self.fusion_module(cooccurrence_feat, spatial_feat, visual_feat)
-
-            # Reshape graph features
-            graph_feat_flat = fused_graph_feat.view(batch_size, self.num_classes, self.hidden_dim)
-
-            # Combine with visual features for final prediction
-            combined_features = torch.cat([
-                features.unsqueeze(1).expand(-1, self.num_classes, -1),
-                graph_feat_flat
-            ], dim=2)
-
-            # Apply final classifier
-            refined_logits = self.classifier(combined_features.view(batch_size * self.num_classes, -1))
-            refined_logits = refined_logits.squeeze(-1).view(batch_size, self.num_classes)
-        except Exception as e:
-            print(f"Error in graph processing: {e}")
-            # On error, use backbone logits as the final prediction
-            refined_logits = logits
-
-        # Compute loss if labels are provided
-        loss = None
-        if labels is not None:
+            # Graph components with timeout handling
             try:
-                # Combine losses from initial and refined predictions
-                initial_loss = self.criterion(logits, labels)
-                refined_loss = self.criterion(refined_logits, labels)
-                loss = 0.4 * initial_loss + 0.6 * refined_loss
+                with torch.cuda.amp.autocast(enabled=True):  # Use mixed precision
+                    cooccurrence_feat = self.cooccurrence_graph(node_features, labels_device)
+                    spatial_feat = self.spatial_graph(node_features, bboxes_fixed, bbox_classes_fixed)
+                    visual_feat = self.visual_graph(node_features, features, labels_device)
+
+                    # Fuse graph features
+                    fused_graph_feat = self.fusion_module(cooccurrence_feat, spatial_feat, visual_feat)
+
+                    # Reshape graph features
+                    graph_feat_flat = fused_graph_feat.view(batch_size, self.num_classes, self.hidden_dim)
+
+                    # Combine with visual features for final prediction
+                    combined_features = torch.cat([
+                        features.unsqueeze(1).expand(-1, self.num_classes, -1),
+                        graph_feat_flat
+                    ], dim=2)
+
+                    # Apply final classifier
+                    refined_logits = self.classifier(combined_features.view(batch_size * self.num_classes, -1))
+                    refined_logits = refined_logits.squeeze(-1).view(batch_size, self.num_classes)
             except Exception as e:
-                print(f"Error computing loss: {e}")
-                # Fallback to using just the initial loss
+                print(f"Error in graph processing: {e}")
+                # On error, use backbone logits as the final prediction
+                refined_logits = logits
+
+            # Compute loss if labels are provided
+            loss = None
+            if labels is not None:
+                try:
+                    # Combine losses from initial and refined predictions
+                    initial_loss = self.criterion(logits, labels)
+                    refined_loss = self.criterion(refined_logits, labels)
+                    loss = 0.4 * initial_loss + 0.6 * refined_loss
+                except Exception as e:
+                    print(f"Error computing loss: {e}")
+                    # Fallback to using just the initial loss
+                    loss = self.criterion(logits, labels)
+
+            return {
+                'logits': refined_logits,
+                'features': features,
+                'loss': loss
+            }
+
+        except Exception as e:
+            print(f"Falling back to backbone prediction due to error: {e}")
+            # Compute loss if labels are provided
+            loss = None
+            if labels is not None:
                 loss = self.criterion(logits, labels)
 
-        return {
-            'logits': refined_logits,
-            'features': features,
-            'loss': loss
-        }
+            return {
+                'logits': logits,
+                'features': features,
+                'loss': loss
+            }
 
