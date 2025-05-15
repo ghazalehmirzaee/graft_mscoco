@@ -48,8 +48,22 @@ class ViTBackbone(nn.Module):
         """Load weights from the pretrained model."""
         print(f"Loading pretrained weights from {pretrained_path}")
 
-        # Set weights_only=False to allow loading of argparse.Namespace objects
-        pretrained_dict = torch.load(pretrained_path, map_location='cpu', weights_only=False)
+        # FIXED: Explicitly set weights_only=False to handle argparse.Namespace objects
+        try:
+            # First try a safer approach with a custom safelist (for PyTorch 2.6+)
+            import argparse
+            try:
+                from torch.serialization import add_safe_globals
+                with add_safe_globals([argparse.Namespace]):
+                    pretrained_dict = torch.load(pretrained_path, map_location='cpu')
+            except (ImportError, AttributeError):
+                # Fallback for older PyTorch versions
+                pretrained_dict = torch.load(pretrained_path, map_location='cpu')
+        except Exception as e:
+            print(f"First loading attempt failed with error: {str(e)}")
+            print("Trying with weights_only=False for backward compatibility...")
+            # Fall back to the less secure option if needed
+            pretrained_dict = torch.load(pretrained_path, map_location='cpu', weights_only=False)
 
         # Print some info about the loaded weights for debugging
         if isinstance(pretrained_dict, dict):
@@ -61,59 +75,45 @@ class ViTBackbone(nn.Module):
                 pretrained_dict = pretrained_dict['model']
                 print(
                     f"Updated pretrained dict keys: {list(pretrained_dict.keys())[:10] if len(pretrained_dict) > 0 else 'empty'}")
+            elif 'state_dict' in pretrained_dict:
+                print("Found 'state_dict' key in pretrained weights")
+                pretrained_dict = pretrained_dict['state_dict']
+                print(
+                    f"Updated pretrained dict keys: {list(pretrained_dict.keys())[:10] if len(pretrained_dict) > 0 else 'empty'}")
 
-            # Extract encoder weights if they have 'encoder.' prefix
-            encoder_state_dict = {}
-            for k, v in pretrained_dict.items():
-                new_key = k
-                # Remove prefixes if present
-                if k.startswith('encoder.'):
-                    new_key = k[8:]  # Remove 'encoder.' prefix
-                elif k.startswith('module.'):
-                    new_key = k[7:]  # Remove 'module.' prefix
-
-                encoder_state_dict[new_key] = v
+            # Create a new dict with modified keys
+            new_state_dict = {}
 
             # Get the model state dict
             model_dict = self.model.state_dict()
 
-            # Print some keys for debugging
-            print(f"Model keys: {list(model_dict.keys())[:5]}")
-            print(f"Encoder keys: {list(encoder_state_dict.keys())[:5]}")
-
-            # Try to match keys
-            matched_dict = {}
-            for model_key in model_dict.keys():
+            # Try to match keys between pretrained and model
+            for k, v in model_dict.items():
                 # Try direct match
-                if model_key in encoder_state_dict:
-                    if model_dict[model_key].shape == encoder_state_dict[model_key].shape:
-                        matched_dict[model_key] = encoder_state_dict[model_key]
+                if k in pretrained_dict and pretrained_dict[k].shape == v.shape:
+                    new_state_dict[k] = pretrained_dict[k]
+                    continue
 
-                # Try without 'blocks.' prefix
-                elif model_key.startswith('blocks.'):
-                    potential_key = model_key.replace('blocks.', 'transformer.encoderblock.')
-                    if potential_key in encoder_state_dict and model_dict[model_key].shape == encoder_state_dict[
-                        potential_key].shape:
-                        matched_dict[model_key] = encoder_state_dict[potential_key]
+                # Try with different prefixes
+                for prefix in ['', 'encoder.', 'backbone.', 'model.', 'vit.']:
+                    prefixed_key = prefix + k
+                    if prefixed_key in pretrained_dict and pretrained_dict[prefixed_key].shape == v.shape:
+                        new_state_dict[k] = pretrained_dict[prefixed_key]
+                        break
 
-            # If no matches, try more aggressive matching by parameter shape and name suffix
-            if len(matched_dict) == 0:
-                print("No direct key matches, trying shape-based matching...")
-                for model_key, model_param in model_dict.items():
-                    for enc_key, enc_param in encoder_state_dict.items():
-                        # Check if shapes match and the parameter names have similar endings
-                        if model_param.shape == enc_param.shape and model_key.split('.')[-1] == enc_key.split('.')[-1]:
-                            matched_dict[model_key] = enc_param
+                # Try with different suffixes
+                if 'blocks.' in k:
+                    for alt_pattern in ['transformer.encoderblock.', 'blocks.', 'encoder.layer.']:
+                        alt_key = k.replace('blocks.', alt_pattern)
+                        if alt_key in pretrained_dict and pretrained_dict[alt_key].shape == v.shape:
+                            new_state_dict[k] = pretrained_dict[alt_key]
                             break
 
-            # Update the model state dict with matched weights
-            model_dict.update(matched_dict)
-            self.model.load_state_dict(model_dict)
-
-            print(f"Loaded {len(matched_dict)} / {len(model_dict)} parameters")
+            # Load the matched weights
+            self.model.load_state_dict(new_state_dict, strict=False)
+            print(f"Loaded {len(new_state_dict)} / {len(model_dict)} parameters")
         else:
-            print(f"Pretrained weights not in expected dictionary format. Type: {type(pretrained_dict)}")
-
+            print(f"Warning: Pretrained weights not in expected format. Type: {type(pretrained_dict)}")
 
     def forward(self, x):
         """Forward pass through the backbone and head."""

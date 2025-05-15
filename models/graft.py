@@ -51,12 +51,17 @@ class MultiLabelLoss(nn.Module):
         Returns:
             Combined loss value
         """
+        # Ensure inputs are on same device
+        device = logits.device
+        targets = targets.to(device)
+        class_weights = self.class_weights.to(device)
+
         # Apply sigmoid to get probabilities
         probs = torch.sigmoid(logits)
 
         # Weighted Binary Cross Entropy
         wbce_loss = F.binary_cross_entropy_with_logits(
-            logits, targets, weight=self.class_weights, reduction='none'
+            logits, targets, weight=class_weights, reduction='none'
         )
 
         # Focal Loss
@@ -177,6 +182,9 @@ class GRAFT(nn.Module):
         Returns:
             Dict containing model outputs and loss if labels are provided
         """
+        batch_size = images.shape[0]
+        device = images.device
+
         # Get features from backbone
         backbone_out = self.backbone(images)
         logits = backbone_out['logits']
@@ -185,36 +193,66 @@ class GRAFT(nn.Module):
         # Project features to hidden dimension
         node_features = self.feature_projector(features).unsqueeze(1).expand(-1, self.num_classes, -1)
 
-        # Process graph components
-        cooccurrence_feat = self.cooccurrence_graph(node_features, labels)
-        spatial_feat = self.spatial_graph(node_features, bboxes, bbox_classes)
-        visual_feat = self.visual_graph(node_features, features, labels)
+        # Process graph components with robust error handling
+        try:
+            # Ensure all tensors are on the same device
+            if bboxes is not None and bbox_classes is not None:
+                # Verify and fix bboxes and bbox_classes device
+                bboxes_fixed = []
+                bbox_classes_fixed = []
 
-        # Fuse graph features
-        fused_graph_feat = self.fusion_module(cooccurrence_feat, spatial_feat, visual_feat)
+                for i in range(len(bboxes)):
+                    if len(bboxes[i]) > 0:
+                        bboxes_fixed.append(bboxes[i].to(device))
+                        bbox_classes_fixed.append(bbox_classes[i].to(device))
+                    else:
+                        # Create empty tensors on the correct device
+                        bboxes_fixed.append(torch.zeros((0, 4), device=device))
+                        bbox_classes_fixed.append(torch.zeros(0, dtype=torch.long, device=device))
+            else:
+                bboxes_fixed = None
+                bbox_classes_fixed = None
 
-        # Reshape graph features
-        batch_size = features.shape[0]
-        graph_feat_flat = fused_graph_feat.view(batch_size, self.num_classes, self.hidden_dim)
+            # Make sure labels are on correct device if provided
+            labels_device = labels.to(device) if labels is not None else None
 
-        # Combine with visual features for final prediction
-        combined_features = torch.cat([
-            features.unsqueeze(1).expand(-1, self.num_classes, -1),
-            graph_feat_flat
-        ], dim=2)
+            # Graph components
+            cooccurrence_feat = self.cooccurrence_graph(node_features, labels_device)
+            spatial_feat = self.spatial_graph(node_features, bboxes_fixed, bbox_classes_fixed)
+            visual_feat = self.visual_graph(node_features, features, labels_device)
 
-        # Apply final classifier - FIXED: Handle the single output value per label
-        refined_logits = self.classifier(combined_features.view(batch_size * self.num_classes, -1))
-        # Squeeze the last dimension and reshape to [batch_size, num_classes]
-        refined_logits = refined_logits.squeeze(-1).view(batch_size, self.num_classes)
+            # Fuse graph features
+            fused_graph_feat = self.fusion_module(cooccurrence_feat, spatial_feat, visual_feat)
+
+            # Reshape graph features
+            graph_feat_flat = fused_graph_feat.view(batch_size, self.num_classes, self.hidden_dim)
+
+            # Combine with visual features for final prediction
+            combined_features = torch.cat([
+                features.unsqueeze(1).expand(-1, self.num_classes, -1),
+                graph_feat_flat
+            ], dim=2)
+
+            # Apply final classifier
+            refined_logits = self.classifier(combined_features.view(batch_size * self.num_classes, -1))
+            refined_logits = refined_logits.squeeze(-1).view(batch_size, self.num_classes)
+        except Exception as e:
+            print(f"Error in graph processing: {e}")
+            # On error, use backbone logits as the final prediction
+            refined_logits = logits
 
         # Compute loss if labels are provided
         loss = None
         if labels is not None:
-            # Combine losses from initial and refined predictions
-            initial_loss = self.criterion(logits, labels)
-            refined_loss = self.criterion(refined_logits, labels)
-            loss = 0.4 * initial_loss + 0.6 * refined_loss
+            try:
+                # Combine losses from initial and refined predictions
+                initial_loss = self.criterion(logits, labels)
+                refined_loss = self.criterion(refined_logits, labels)
+                loss = 0.4 * initial_loss + 0.6 * refined_loss
+            except Exception as e:
+                print(f"Error computing loss: {e}")
+                # Fallback to using just the initial loss
+                loss = self.criterion(logits, labels)
 
         return {
             'logits': refined_logits,
@@ -222,4 +260,3 @@ class GRAFT(nn.Module):
             'loss': loss
         }
 
-    

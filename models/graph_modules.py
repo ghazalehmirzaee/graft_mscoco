@@ -61,7 +61,7 @@ class CooccurrenceGraph(nn.Module):
                     # Calculate balance factor based on frequency of rare class
                     rare_idx = i if class_counts[i] < class_counts[j] else j
                     rare_weight = ((max_count / avg_count) ** alpha) * (
-                                (min(class_counts[i], class_counts[j]) / max(class_counts[i], class_counts[j])) ** beta)
+                            (min(class_counts[i], class_counts[j]) / max(class_counts[i], class_counts[j])) ** beta)
 
                     # Apply correction weight
                     self.cooccurrence[i, j] *= rare_weight
@@ -86,6 +86,7 @@ class CooccurrenceGraph(nn.Module):
             Updated node features
         """
         batch_size = x.shape[0]
+        device = x.device  # FIXED: Get device from input tensor
 
         # Use label embeddings as node features if x is None
         if x is None:
@@ -101,7 +102,9 @@ class CooccurrenceGraph(nn.Module):
                     self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
 
         # Apply co-occurrence as edge weights
-        scores = scores * self.cooccurrence.unsqueeze(0)
+        # FIXED: Ensure cooccurrence is on the same device
+        cooccurrence = self.cooccurrence.to(device)
+        scores = scores * cooccurrence.unsqueeze(0)
 
         # If labels are provided, use them to guide attention
         if labels is not None:
@@ -174,12 +177,12 @@ class SpatialGraph(nn.Module):
             Dict of spatial distribution grids for each scale
         """
         batch_size = len(bboxes)
+        device = bboxes[0].device if len(bboxes) > 0 and len(bboxes[0]) > 0 else torch.device('cpu')
         distributions = {}
 
         for scale in self.scales:
             # Initialize distribution grid for each class
-            grid = torch.zeros(batch_size, self.num_classes, scale, scale,
-                               device=bboxes[0].device if len(bboxes) > 0 and len(bboxes[0]) > 0 else 'cpu')
+            grid = torch.zeros(batch_size, self.num_classes, scale, scale, device=device)
 
             # For each batch
             for b in range(batch_size):
@@ -219,7 +222,6 @@ class SpatialGraph(nn.Module):
 
         return distributions
 
-
     def _compute_spatial_affinity(self, spatial_dists):
         """
         Compute spatial affinity matrix from spatial distributions.
@@ -231,10 +233,10 @@ class SpatialGraph(nn.Module):
             Spatial affinity matrix
         """
         batch_size = spatial_dists[self.scales[0]].shape[0]
+        device = spatial_dists[self.scales[0]].device
 
         # Initialize affinity matrix
-        affinity = torch.zeros(batch_size, self.num_classes, self.num_classes,
-                               device=spatial_dists[self.scales[0]].device)
+        affinity = torch.zeros(batch_size, self.num_classes, self.num_classes, device=device)
 
         # For each scale
         for scale_idx, scale in enumerate(self.scales):
@@ -270,10 +272,12 @@ class SpatialGraph(nn.Module):
             Updated node features
         """
         batch_size = x.shape[0] if x is not None else (len(bboxes) if bboxes is not None else 1)
+        device = x.device if x is not None else (
+            bboxes[0].device if bboxes is not None and len(bboxes) > 0 and len(bboxes[0]) > 0 else torch.device('cpu'))
 
         # Use label embeddings as node features if x is None
         if x is None:
-            x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+            x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1).to(device)
 
         # Generate queries, keys, values
         q = self.proj_q(x)  # (batch_size, num_classes, hidden_dim)
@@ -285,15 +289,19 @@ class SpatialGraph(nn.Module):
                     self.hidden_dim ** 0.5)  # (batch_size, num_classes, num_classes)
 
         # If bounding boxes are provided, compute spatial affinity
-        if bboxes is not None and bbox_classes is not None:
-            spatial_dists = self._compute_spatial_distributions(bboxes, bbox_classes)
-            spatial_affinity = self._compute_spatial_affinity(spatial_dists)
-
-            # Apply spatial affinity as edge weights
-            scores = scores * spatial_affinity
+        if bboxes is not None and bbox_classes is not None and all(len(b) > 0 for b in bboxes):
+            try:
+                spatial_dists = self._compute_spatial_distributions(bboxes, bbox_classes)
+                spatial_affinity = self._compute_spatial_affinity(spatial_dists)
+                # Apply spatial affinity as edge weights
+                scores = scores * spatial_affinity
+            except Exception as e:
+                print(f"Error computing spatial distributions: {e}")
+                # Use default affinity (identity)
+                scores = scores * self.spatial_affinity.to(device).unsqueeze(0)
         else:
             # Use default affinity (identity)
-            scores = scores * self.spatial_affinity.unsqueeze(0)
+            scores = scores * self.spatial_affinity.to(device).unsqueeze(0)
 
         # Apply attention
         attn = F.softmax(scores, dim=-1)
@@ -365,20 +373,25 @@ class VisualGraph(nn.Module):
         Returns:
             Updated node features
         """
+        device = x.device if x is not None else visual_features.device
         batch_size = x.shape[0] if x is not None else visual_features.shape[0]
 
         # Use label embeddings as node features if x is None
         if x is None:
-            x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1)
+            x = self.label_embeddings.unsqueeze(0).expand(batch_size, -1, -1).to(device)
 
         # Project visual features if provided
         if visual_features is not None:
             vis_emb = self.visual_proj(visual_features)  # (batch_size, hidden_dim)
 
             # Extract class-specific features
-            class_feats = torch.stack([
-                extractor(vis_emb) for extractor in self.class_extractors
-            ], dim=1)  # (batch_size, num_classes, hidden_dim)
+            class_feats = []
+            for i in range(self.num_classes):
+                # Move extractor to correct device if needed
+                extractor = self.class_extractors[i].to(device)
+                class_feats.append(extractor(vis_emb))
+
+            class_feats = torch.stack(class_feats, dim=1)  # (batch_size, num_classes, hidden_dim)
 
             # Combine with existing features
             x = x + class_feats
@@ -454,16 +467,24 @@ class GraphFusionModule(nn.Module):
         Returns:
             Fused features
         """
+        # Make sure all features are on the same device
+        device = cooccurrence_feat.device
+
+        # Move uncertainty parameters to the correct device
+        cooccurrence_uncertainty = self.cooccurrence_uncertainty.to(device)
+        spatial_uncertainty = self.spatial_uncertainty.to(device)
+        visual_uncertainty = self.visual_uncertainty.to(device)
+
         # Calculate uncertainty weights
         total_uncertainty = (
-                1.0 / self.cooccurrence_uncertainty +
-                1.0 / self.spatial_uncertainty +
-                1.0 / self.visual_uncertainty
+                1.0 / cooccurrence_uncertainty +
+                1.0 / spatial_uncertainty +
+                1.0 / visual_uncertainty
         )
 
-        cooccurrence_weight = (1.0 / self.cooccurrence_uncertainty) / total_uncertainty
-        spatial_weight = (1.0 / self.spatial_uncertainty) / total_uncertainty
-        visual_weight = (1.0 / self.visual_uncertainty) / total_uncertainty
+        cooccurrence_weight = (1.0 / cooccurrence_uncertainty) / total_uncertainty
+        spatial_weight = (1.0 / spatial_uncertainty) / total_uncertainty
+        visual_weight = (1.0 / visual_uncertainty) / total_uncertainty
 
         # Weighted combination
         fused_feat = (
