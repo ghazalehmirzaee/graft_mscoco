@@ -5,7 +5,7 @@ import datetime
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -183,8 +183,8 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, config, writer
         # Zero the parameter gradients
         optimizer.zero_grad()
 
-        # Mixed precision training
-        with autocast():
+        # Mixed precision training - FIXED: proper autocast usage
+        with autocast(device_type='cuda', enabled=True):
             outputs = model(images, labels, bboxes, bbox_cat_idxs)
             loss = outputs['loss']
 
@@ -374,8 +374,8 @@ def train_and_eval(rank, world_size, config):
             eta_min=config.MIN_LR
         )
 
-        # Initialize gradient scaler for mixed precision training
-        scaler = GradScaler()
+        # Initialize gradient scaler for mixed precision training - FIXED: proper GradScaler initialization
+        scaler = GradScaler(enabled=True)
 
         # Resume from checkpoint if available
         start_epoch = 0
