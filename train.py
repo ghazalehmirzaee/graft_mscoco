@@ -173,70 +173,113 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, config, writer
 
     # Set learning rate for this epoch
     for param_group in optimizer.param_groups:
-        if writer is not None:
+        if writer is not None and is_main_process(device):
             writer.add_scalar('train/lr', param_group['lr'], epoch)
 
+    # Track successful and failed batches
+    successful_batches = 0
+    failed_batches = 0
+    total_batches = len(data_loader)
+
     for i, sample in enumerate(metric_logger.log_every(data_loader, config.LOG_INTERVAL, header)):
-        # Get inputs and labels
-        images = sample['image'].to(device, non_blocking=True)
-        labels = sample['labels'].to(device, non_blocking=True)
-        bboxes = sample['bboxes']  # Already a list of tensors
-        bbox_cat_idxs = sample['bbox_cat_idxs']  # Already a list of tensors
+        try:
+            # Get inputs and labels
+            images = sample['image'].to(device, non_blocking=True)
+            labels = sample['labels'].to(device, non_blocking=True)
+            bboxes = sample['bboxes']  # Already a list of tensors
+            bbox_cat_idxs = sample['bbox_cat_idxs']  # Already a list of tensors
 
-        # Move bbox data to device
-        bboxes = [b.to(device, non_blocking=True) for b in bboxes]
-        bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
-
-        # Zero the parameter gradients
-        optimizer.zero_grad()
-
-        # Mixed precision training - FIXED: proper autocast usage
-        with autocast(device_type='cuda', enabled=True):
+            # Move bbox data to device
             try:
-                outputs = model(images, labels, bboxes, bbox_cat_idxs)
-                loss = outputs['loss']
+                bboxes = [b.to(device, non_blocking=True) for b in bboxes]
+                bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
             except Exception as e:
-                print(f"Error in forward pass: {e}")
-                continue  # Skip this batch if there's an error
+                print(f"Warning: Failed to move bbox data to device: {e}. Using empty bboxes.")
+                bboxes = None
+                bbox_cat_idxs = None
 
-        # Scale loss and compute gradients
-        scaler.scale(loss).backward()
+            # Zero the parameter gradients
+            optimizer.zero_grad()
 
-        # Update weights
-        scaler.step(optimizer)
-        scaler.update()
+            # Mixed precision training
+            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', enabled=True):
+                try:
+                    outputs = model(images, labels, bboxes, bbox_cat_idxs)
+                    loss = outputs['loss']
+                except Exception as e:
+                    print(f"Error in forward pass: {e}")
+                    # Skip this batch
+                    failed_batches += 1
+                    continue
 
-        # Reduce loss across all processes
-        if config.NUM_GPUS > 1:
-            reduced_loss = reduce_tensor(loss.detach(), config.NUM_GPUS)
-        else:
-            reduced_loss = loss.detach()
+            # Check for NaN losses
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Warning: NaN or Inf loss detected. Skipping batch {i}.")
+                failed_batches += 1
+                continue
 
-        # Log metrics
-        metric_logger.update(loss=reduced_loss.item())
-        metric_logger.update(lr=optimizer.param_groups[0]['lr'])
+            # Scale loss and compute gradients
+            scaler.scale(loss).backward()
 
-        # Log to TensorBoard
-        global_step = epoch * len(data_loader) + i
-        if is_main_process(device) and writer is not None:
-            writer.add_scalar('train/loss', reduced_loss.item(), global_step)
+            # Unscale optimizer to check for inf/nan gradients
+            scaler.unscale_(optimizer)
 
-            # Visualize predictions for first batch of each epoch
-            if i == 0 and epoch % 5 == 0:
-                # Create visualization
-                with torch.no_grad():
-                    fig = visualize_predictions(
-                        images[:5].detach().cpu(),
-                        labels[:5].detach().cpu(),
-                        outputs['logits'][:5].detach().cpu(),
-                        [f"Class_{i}" for i in range(config.NUM_CLASSES)],
-                        # Use generic class names if actual ones not available
-                        num_samples=5
-                    )
-                    writer.add_figure(f'train/predictions_epoch_{epoch}', fig, global_step)
+            # Clip gradients to avoid explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Update weights
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Reduce loss across all processes
+            if config.NUM_GPUS > 1:
+                try:
+                    reduced_loss = reduce_tensor(loss.detach(), config.NUM_GPUS)
+                except Exception as e:
+                    print(f"Warning: Failed to reduce loss: {e}")
+                    reduced_loss = loss.detach()
+            else:
+                reduced_loss = loss.detach()
+
+            # Log metrics
+            metric_logger.update(loss=reduced_loss.item())
+            metric_logger.update(lr=optimizer.param_groups[0]['lr'])
+
+            # Log to TensorBoard
+            global_step = epoch * len(data_loader) + i
+            if is_main_process(device) and writer is not None:
+                writer.add_scalar('train/loss', reduced_loss.item(), global_step)
+
+                # Visualize predictions for first batch of each epoch
+                if i == 0 and epoch % 5 == 0:
+                    # Create visualization
+                    with torch.no_grad():
+                        fig = visualize_predictions(
+                            images[:5].detach().cpu(),
+                            labels[:5].detach().cpu(),
+                            outputs['logits'][:5].detach().cpu(),
+                            [f"Class_{i}" for i in range(config.NUM_CLASSES)],
+                            num_samples=min(5, images.shape[0])
+                        )
+                        writer.add_figure(f'train/predictions_epoch_{epoch}', fig, global_step)
+
+            successful_batches += 1
+
+            # Add synchronization point every few iterations to prevent hanging
+            if i % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.synchronize()
+
+        except Exception as e:
+            print(f"Error processing batch {i}: {e}")
+            failed_batches += 1
+            # Try to recover and continue with next batch
+            continue
+
+    # Report success rate
+    print(f"Epoch {epoch} completed: {successful_batches}/{total_batches} batches successful ({failed_batches} failed)")
 
     # Return average loss
-    return metric_logger.meters['loss'].global_avg
+    return metric_logger.meters['loss'].global_avg if 'loss' in metric_logger.meters else float('nan')
 
 
 def evaluate(model, data_loader, device, epoch, config, writer):
