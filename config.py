@@ -24,15 +24,21 @@ class Config:
 
     # Distributed training parameters
     NUM_GPUS = 8
-    NUM_WORKERS = 2  # Reduced for initial testing
-    BATCH_SIZE = 16  # Reduced for initial testing
+    NUM_WORKERS = 1  # Reduced to minimize memory pressure
+    BATCH_SIZE = 4   # Reduced from 16 to prevent memory issues
 
-    # Training parameters - simplified for initial testing
+    # NCCL parameters
+    NCCL_DEBUG = "INFO"
+    NCCL_SOCKET_IFNAME = "^lo,docker"
+    NCCL_IB_DISABLE = "1"  # Disable InfiniBand
+    NCCL_P2P_DISABLE = "1"  # Disable P2P explicitly
+
+    # Training parameters
     NUM_EPOCHS = 1
-    BASE_LR = 2.5e-4
+    BASE_LR = 1e-4     # Reduced learning rate
     WEIGHT_DECAY = 0.05
     WARMUP_EPOCHS = 1
-    MIN_LR = 1e-5
+    MIN_LR = 1e-6
     DROP_PATH = 0.2
 
     # Multi-component loss weights
@@ -48,12 +54,17 @@ class Config:
 
     # Logging and checkpointing
     OUTPUT_DIR = os.path.join("outputs", datetime.now().strftime("%Y%m%d_%H%M%S"))
-    LOG_INTERVAL = 50
+    LOG_INTERVAL = 10  # More frequent logging
     EVAL_INTERVAL = 1
     CKPT_INTERVAL = 1
 
     # Random seed for reproducibility
     SEED = 42
+
+    # Graph complexity management
+    ENABLE_GRAPH_COMPONENTS = True  # Toggle to disable graph components during debugging
+    SIMPLIFIED_GRAPH_MODE = True    # Use simplified graph operations
+    TIMEOUT_MINUTES = 20            # Increase timeout for operations
 
     def __init__(self):
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
@@ -64,3 +75,12 @@ class Config:
                 f"Warning: Reducing batch size from {self.BATCH_SIZE} to {self.BATCH_SIZE // 2} due to GPU memory constraints")
             self.BATCH_SIZE = self.BATCH_SIZE // 2
 
+        # Set NCCL environment variables
+        os.environ["NCCL_DEBUG"] = self.NCCL_DEBUG
+        os.environ["NCCL_SOCKET_IFNAME"] = self.NCCL_SOCKET_IFNAME
+        os.environ["NCCL_IB_DISABLE"] = self.NCCL_IB_DISABLE
+        os.environ["NCCL_P2P_DISABLE"] = self.NCCL_P2P_DISABLE
+        os.environ["TORCH_DISTRIBUTED_DETAIL"] = "DEBUG"
+        os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"  # Enable async error handling
+
+        
