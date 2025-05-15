@@ -146,8 +146,8 @@ class GRAFT(nn.Module):
             hidden_dim=self.hidden_dim
         )
 
-        # Final classifier
-        self.classifier = nn.Linear(self.hidden_dim + self.feature_dim, self.num_classes)
+        # Final classifier - FIXED: Output 1 value per class instead of num_classes
+        self.classifier = nn.Linear(self.hidden_dim + self.feature_dim, 1)
 
         # Loss function
         self.criterion = MultiLabelLoss(
@@ -203,9 +203,10 @@ class GRAFT(nn.Module):
             graph_feat_flat
         ], dim=2)
 
-        # Apply final classifier
+        # Apply final classifier - FIXED: Handle the single output value per label
         refined_logits = self.classifier(combined_features.view(batch_size * self.num_classes, -1))
-        refined_logits = refined_logits.view(batch_size, self.num_classes)
+        # Squeeze the last dimension and reshape to [batch_size, num_classes]
+        refined_logits = refined_logits.squeeze(-1).view(batch_size, self.num_classes)
 
         # Compute loss if labels are provided
         loss = None
