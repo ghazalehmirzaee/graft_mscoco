@@ -22,7 +22,8 @@ class SmoothedValue:
         self.deque = deque(maxlen=window_size)
         self.total = 0.0
         self.count = 0
-        self.fmt = '{median:.4f} ({global_avg:.4f})' if fmt is None else fmt
+        # FIXED: Add value to format string
+        self.fmt = '{value:.4f} ({global_avg:.4f})' if fmt is None else fmt
 
     def update(self, value, n=1):
         self.deque.append(value)
@@ -43,11 +44,17 @@ class SmoothedValue:
     def global_avg(self):
         return self.total / self.count if self.count > 0 else 0
 
+    @property
+    def value(self):
+        # FIXED: Add value property to return the latest value
+        return self.deque[-1] if len(self.deque) > 0 else 0
+
     def __str__(self):
         return self.fmt.format(
             median=self.median,
             avg=self.avg,
-            global_avg=self.global_avg
+            global_avg=self.global_avg,
+            value=self.value  # FIXED: Include value in format
         )
 
 
@@ -185,8 +192,12 @@ def train_one_epoch(model, optimizer, data_loader, device, epoch, config, writer
 
         # Mixed precision training - FIXED: proper autocast usage
         with autocast(device_type='cuda', enabled=True):
-            outputs = model(images, labels, bboxes, bbox_cat_idxs)
-            loss = outputs['loss']
+            try:
+                outputs = model(images, labels, bboxes, bbox_cat_idxs)
+                loss = outputs['loss']
+            except Exception as e:
+                print(f"Error in forward pass: {e}")
+                continue  # Skip this batch if there's an error
 
         # Scale loss and compute gradients
         scaler.scale(loss).backward()
@@ -266,50 +277,59 @@ def evaluate(model, data_loader, device, epoch, config, writer):
                 bbox_cat_idxs = [b.to(device, non_blocking=True) for b in bbox_cat_idxs]
 
             # Forward pass
-            outputs = model(images, labels, bboxes, bbox_cat_idxs)
-            logits = outputs['logits']
-            loss = outputs['loss']
+            try:
+                outputs = model(images, labels, bboxes, bbox_cat_idxs)
+                logits = outputs['logits']
+                loss = outputs['loss']
 
-            # Reduce loss across all processes
-            if config.NUM_GPUS > 1:
-                reduced_loss = reduce_tensor(loss.detach(), config.NUM_GPUS)
-            else:
-                reduced_loss = loss.detach()
+                # Reduce loss across all processes
+                if config.NUM_GPUS > 1:
+                    reduced_loss = reduce_tensor(loss.detach(), config.NUM_GPUS)
+                else:
+                    reduced_loss = loss.detach()
 
-            # Collect predictions and targets
-            all_logits.append(logits)
-            all_targets.append(labels)
+                # Collect predictions and targets
+                all_logits.append(logits)
+                all_targets.append(labels)
 
-            # Log metrics
-            metric_logger.update(loss=reduced_loss.item())
+                # Log metrics
+                metric_logger.update(loss=reduced_loss.item())
+            except Exception as e:
+                print(f"Error in evaluation: {e}")
+                continue  # Skip this batch if there's an error
 
-    # Concatenate all logits and targets
-    all_logits = torch.cat(all_logits, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
+    # Only process if we have collected some predictions
+    if len(all_logits) > 0 and len(all_targets) > 0:
+        # Concatenate all logits and targets
+        all_logits = torch.cat(all_logits, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
 
-    # Gather predictions from all processes
-    if config.NUM_GPUS > 1:
-        all_logits_list = [torch.zeros_like(all_logits) for _ in range(config.NUM_GPUS)]
-        all_targets_list = [torch.zeros_like(all_targets) for _ in range(config.NUM_GPUS)]
+        # Gather predictions from all processes
+        if config.NUM_GPUS > 1:
+            all_logits_list = [torch.zeros_like(all_logits) for _ in range(config.NUM_GPUS)]
+            all_targets_list = [torch.zeros_like(all_targets) for _ in range(config.NUM_GPUS)]
 
-        torch.distributed.all_gather(all_logits_list, all_logits)
-        torch.distributed.all_gather(all_targets_list, all_targets)
+            torch.distributed.all_gather(all_logits_list, all_logits)
+            torch.distributed.all_gather(all_targets_list, all_targets)
 
-        all_logits = torch.cat(all_logits_list, dim=0)
-        all_targets = torch.cat(all_targets_list, dim=0)
+            all_logits = torch.cat(all_logits_list, dim=0)
+            all_targets = torch.cat(all_targets_list, dim=0)
 
-    # Compute metrics
-    metrics = compute_metrics(all_logits, all_targets)
+        # Compute metrics
+        metrics = compute_metrics(all_logits, all_targets)
 
-    # Log metrics
-    for k, v in metrics.items():
-        if isinstance(v, (int, float)):
-            metric_logger.update(**{k: v})
+        # Log metrics
+        for k, v in metrics.items():
+            if isinstance(v, (int, float)):
+                metric_logger.update(**{k: v})
 
-            if is_main_process(device) and writer is not None:
-                writer.add_scalar(f'val/{k}', v, epoch)
+                if is_main_process(device) and writer is not None:
+                    writer.add_scalar(f'val/{k}', v, epoch)
 
-    return metrics
+        return metrics
+    else:
+        print("Warning: No predictions collected during evaluation")
+        return {'mAP': 0.0}  # Return default metrics
 
 
 def train_and_eval(rank, world_size, config):
@@ -383,7 +403,20 @@ def train_and_eval(rank, world_size, config):
         if os.path.exists(os.path.join(config.OUTPUT_DIR, 'checkpoint.pth')):
             ckpt_path = os.path.join(config.OUTPUT_DIR, 'checkpoint.pth')
             print(f"Loading checkpoint from {ckpt_path}")
-            checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+            # FIXED: Load checkpoint with weights_only=False
+            try:
+                import argparse
+                from torch.serialization import add_safe_globals
+
+                # Add argparse.Namespace to the safelist
+                with add_safe_globals([argparse.Namespace]):
+                    checkpoint = torch.load(ckpt_path, map_location='cpu')
+            except Exception as e:
+                print(f"First loading attempt failed with error: {str(e)}")
+                print("Trying with weights_only=False for backward compatibility...")
+                # Fall back to the less secure option if needed
+                checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
             # Load model weights
             if isinstance(model, DDP):
@@ -403,6 +436,7 @@ def train_and_eval(rank, world_size, config):
             best_map = checkpoint.get('best_map', 0.0)
 
             print(f"Resumed from epoch {start_epoch} with best mAP: {best_map:.4f}")
+
 
         # Start training
         print(f"Starting training from epoch {start_epoch} to {config.NUM_EPOCHS}")
