@@ -116,8 +116,23 @@ def load_checkpoint(model, optimizer, scheduler, filename):
         return 0, 0.0
 
     print(f"Loading checkpoint from {filename}")
-    # Fixed: Set weights_only=False to allow loading of argparse.Namespace objects
-    checkpoint = torch.load(filename, map_location='cpu', weights_only=False)
+
+    # FIXED: Handle different PyTorch versions
+    try:
+        # First try with Namespace in safelist (for PyTorch 2.6+)
+        import argparse
+        try:
+            from torch.serialization import add_safe_globals
+            with add_safe_globals([argparse.Namespace]):
+                checkpoint = torch.load(filename, map_location='cpu')
+        except (ImportError, AttributeError):
+            # Fallback for older PyTorch versions without add_safe_globals
+            checkpoint = torch.load(filename, map_location='cpu')
+    except Exception as e:
+        print(f"First loading attempt failed with error: {str(e)}")
+        print("Trying with weights_only=False for backward compatibility...")
+        # Fall back to the less secure option if needed
+        checkpoint = torch.load(filename, map_location='cpu', weights_only=False)
 
     model.load_state_dict(checkpoint['model'])
     optimizer.load_state_dict(checkpoint['optimizer'])
@@ -138,23 +153,16 @@ def save_checkpoint(state, is_best, output_dir):
         output_dir: Directory to save checkpoints
     """
     filename = os.path.join(output_dir, 'checkpoint.pth')
-    # Save using backward-compatible format
-    torch.save(state, filename, _use_new_zipfile_serialization=False)
+    # Standard saving without the deprecated parameter
+    torch.save(state, filename)
     if is_best:
         best_filename = os.path.join(output_dir, 'model_best.pth')
-        torch.save(state, best_filename, _use_new_zipfile_serialization=False)
+        torch.save(state, best_filename)
 
 
 def visualize_predictions(images, targets, predictions, class_names, num_samples=5):
     """
     Visualize model predictions for a few samples.
-
-    Args:
-        images: Batch of images
-        targets: Ground-truth labels
-        predictions: Model predictions
-        class_names: List of class names
-        num_samples: Number of samples to visualize
     """
     num_samples = min(num_samples, images.size(0))
     fig, axes = plt.subplots(num_samples, 1, figsize=(12, 4 * num_samples))
@@ -200,11 +208,6 @@ def visualize_predictions(images, targets, predictions, class_names, num_samples
 def visualize_attention(attention_weights, class_names, num_classes=10):
     """
     Visualize attention weights between label nodes.
-
-    Args:
-        attention_weights: Attention weights matrix (num_classes, num_classes)
-        class_names: List of class names
-        num_classes: Number of top classes to visualize
     """
     # Use only top num_classes for visualization
     top_classes = min(num_classes, len(class_names))
