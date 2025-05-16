@@ -1,6 +1,7 @@
 import os
 import torch
 from datetime import datetime
+import json
 
 
 class Config:
@@ -25,7 +26,7 @@ class Config:
     # Distributed training parameters
     NUM_GPUS = 8
     NUM_WORKERS = 1  # Reduced to minimize memory pressure
-    BATCH_SIZE = 4   # Reduced from 16 to prevent memory issues
+    BATCH_SIZE = 4  # Reduced from 16 to prevent memory issues
 
     # NCCL parameters
     NCCL_DEBUG = "INFO"
@@ -35,7 +36,7 @@ class Config:
 
     # Training parameters
     NUM_EPOCHS = 1
-    BASE_LR = 1e-4     # Reduced learning rate
+    BASE_LR = 1e-4  # Reduced learning rate
     WEIGHT_DECAY = 0.05
     WARMUP_EPOCHS = 1
     MIN_LR = 1e-6
@@ -63,11 +64,32 @@ class Config:
 
     # Graph complexity management
     ENABLE_GRAPH_COMPONENTS = True  # Toggle to disable graph components during debugging
-    SIMPLIFIED_GRAPH_MODE = True    # Use simplified graph operations
-    TIMEOUT_MINUTES = 20            # Increase timeout for operations
+    SIMPLIFIED_GRAPH_MODE = True  # Use simplified graph operations
+    TIMEOUT_MINUTES = 20  # Increase timeout for operations
+
+    # Dataset subset parameters
+    USE_SUBSET = True  # Whether to use a subset of MS-COCO
+    SUBSET_SIZE = 5000  # Number of images in train subset
+    SUBSET_VAL_SIZE = 1000  # Number of images in validation subset
+    SUBSET_BALANCED = True  # Whether to ensure class balance in subset
+
+    # Computational complexity tracking
+    TRACK_COMPLEXITY = True  # Whether to track computational complexity
+    COMPLEXITY_LOG_INTERVAL = 50  # How often to log complexity metrics
+
+    # Metrics saving
+    SAVE_METRICS = True  # Whether to save metrics to JSON
+    METRICS_DIR = None  # Will be set in __init__
 
     def __init__(self):
         os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        self.METRICS_DIR = os.path.join(self.OUTPUT_DIR, 'metrics')
+        os.makedirs(self.METRICS_DIR, exist_ok=True)
+
+        # Save config to JSON for reproducibility
+        config_dict = {k: v for k, v in self.__dict__.items() if not k.startswith('__') and not callable(v)}
+        with open(os.path.join(self.OUTPUT_DIR, 'config.json'), 'w') as f:
+            json.dump(config_dict, f, indent=4)
 
         # Adapt batch size if not enough GPU memory
         if torch.cuda.is_available() and torch.cuda.get_device_properties(0).total_memory < 20e9:  # < 20GB
